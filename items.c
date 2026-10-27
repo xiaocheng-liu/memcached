@@ -20,18 +20,20 @@
 static void item_link_q(item *it);
 static void item_unlink_q(item *it);
 
+/* LRU 类型映射：每个 slab class 内部再按 HOT/WARM/COLD/TEMP 细分 LRU 队列 */
 static unsigned int lru_type_map[4] = {HOT_LRU, WARM_LRU, COLD_LRU, TEMP_LRU};
 
 #define LARGEST_ID POWER_LARGEST
+/* 每个 (slab class id | LRU 类型) 组合的统计信息 */
 typedef struct {
     uint64_t evicted;
     uint64_t evicted_nonzero;
     uint64_t reclaimed;
     uint64_t outofmemory;
     uint64_t tailrepairs;
-    uint64_t expired_unfetched; /* items reclaimed but never touched */
-    uint64_t evicted_unfetched; /* items evicted but never touched */
-    uint64_t evicted_active; /* items evicted that should have been shuffled */
+    uint64_t expired_unfetched; /* 回收但从未被访问过的 item */
+    uint64_t evicted_unfetched; /* 被逐出但从未被访问过的 item */
+    uint64_t evicted_active; /* 本应被重排却仍被逐出的 item */
     uint64_t crawler_reclaimed;
     uint64_t crawler_items_checked;
     uint64_t lrutail_reflocked;
@@ -47,14 +49,15 @@ typedef struct {
     rel_time_t evicted_time;
 } itemstats_t;
 
+/* 每个 LRU 队列的链表头/尾：索引为 (slab class id | LRU 类型) */
 static item *heads[LARGEST_ID];
 static item *tails[LARGEST_ID];
 static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
 static uint64_t sizes_bytes[LARGEST_ID];
-static unsigned int *stats_sizes_hist = NULL;
+static unsigned int *stats_sizes_hist = NULL; /* 按尺寸分布的直方图 */
 static int stats_sizes_buckets = 0;
-static uint64_t cas_id = 1;
+static uint64_t cas_id = 1;        /* 全局自增 CAS 计数器 */
 
 static volatile int do_run_lru_maintainer_thread = 0;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -246,12 +249,14 @@ item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain) {
     return nch;
 }
 
+/* 分配一个新 item（尚未链接进哈希表/LRU）。根据总大小选择合适的 slab class；
+ * 若超过单 chunk 上限，则采用“头对象 + 链式 chunk”的大对象方案。 */
 item *do_item_alloc(const char *key, const size_t nkey, const client_flags_t flags,
                     const rel_time_t exptime, const int nbytes) {
     uint8_t nsuffix;
     item *it = NULL;
     char suffix[40];
-    // Avoid potential underflows.
+    // 避免潜在的下溢
     if (nbytes < 2)
         return 0;
 
@@ -265,20 +270,16 @@ item *do_item_alloc(const char *key, const size_t nkey, const client_flags_t fla
     if (id == 0)
         return 0;
 
-    /* This is a large item. Allocate a header object now, lazily allocate
-     *  chunks while reading the upload.
-     */
+    /* 这是一个大对象：现在先分配一个头对象，上传数据时再惰性分配后续 chunk */
     if (ntotal > settings.slab_chunk_size_max) {
-        /* We still link this item into the LRU for the larger slab class, but
-         * we're pulling a header from an entirely different slab class. The
-         * free routines handle large items specifically.
-         */
+        /* 头对象仍按其“逻辑”大 slab class 加入 LRU，但实际内存取自另一个
+         * 较小的 class。释放逻辑会对大对象做专门处理。 */
         int htotal = nkey + 1 + nsuffix + sizeof(item) + sizeof(item_chunk);
         if (settings.use_cas) {
             htotal += sizeof(uint64_t);
         }
 #ifdef NEED_ALIGN
-        // header chunk needs to be padded on some systems
+        // 某些平台头部 chunk 需要按 8 字节对齐填充
         int remain = htotal % 8;
         if (remain != 0) {
             htotal += 8 - remain;
@@ -286,7 +287,7 @@ item *do_item_alloc(const char *key, const size_t nkey, const client_flags_t fla
 #endif
         hdr_id = slabs_clsid(htotal);
         it = do_item_alloc_pull(htotal, hdr_id);
-        /* setting ITEM_CHUNKED is fine here because we aren't LINKED yet. */
+        /* 此处设置 ITEM_CHUNKED 是安全的，因为 item 尚未链接 */
         if (it != NULL)
             it->it_flags |= ITEM_CHUNKED;
     } else {
@@ -482,6 +483,8 @@ static void item_unlink_q(item *it) {
     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
 
+/* 把 item 正式链接进缓存：标记 ITEM_LINKED，更新全局计数，分配 CAS，
+ * 插入哈希表并挂入对应 LRU 队列头（引用计数 +1）。 */
 int do_item_link(item *it, const uint32_t hv, const uint64_t cas) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
@@ -504,6 +507,8 @@ int do_item_link(item *it, const uint32_t hv, const uint64_t cas) {
     return 1;
 }
 
+/* 将 item 从缓存中解除链接：清除 ITEM_LINKED，更新计数，从哈希表删除，
+ * 从 LRU 队列摘除，并减少引用计数（可能触发真正释放）。 */
 void do_item_unlink(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
@@ -535,6 +540,8 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
     }
 }
 
+/* 减少 item 引用计数；当引用计数降至 0 时真正释放其占用的 slab 内存。
+ * 这是 memcached 内存回收的统一入口。 */
 void do_item_remove(item *it) {
     MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
@@ -545,7 +552,8 @@ void do_item_remove(item *it) {
     }
 }
 
-/* Bump the last accessed time, or relink if we're in compat mode */
+/* 访问 item 时更新其 LRU 位置：在分段 LRU 模式下，COLD 中的命中会立即移到
+ * WARM；否则仅刷新访问时间。保证热点数据不被过早逐出。 */
 void do_item_update(item *it) {
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
 
@@ -971,6 +979,8 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
 }
 
 /** wrapper around assoc_find which does the lazy expiration logic */
+/* 按 key 查找 item。先在哈希表中定位，命中后增加引用计数，并就地处理
+ * flush/过期（惰性过期：取时才判断并回收）。命中且未过期时按需更新 LRU 位置。 */
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, LIBEVENT_THREAD *t, const bool do_update) {
     item *it = assoc_find(key, nkey, hv);
     if (it != NULL) {

@@ -42,70 +42,74 @@
     pthread_mutex_unlock(&e->stats_mutex); \
 }
 
+/* 写缓冲区（write buffer）：以“页”为单位把若干 item 攒批后一次性落盘 */
 typedef struct __store_wbuf {
     struct __store_wbuf *next;
     char *buf;
-    char *buf_pos;
-    unsigned int free;
-    unsigned int size;
-    unsigned int offset; /* offset into page this write starts at */
-    bool full; /* done writing to this page */
-    bool flushed; /* whether wbuf has been flushed to disk */
+    char *buf_pos;   /* 当前写入位置 */
+    unsigned int free;   /* 剩余可写字节 */
+    unsigned int size;   /* 缓冲区总大小 */
+    unsigned int offset; /* 本缓冲区写到页内的起始偏移 */
+    bool full;    /* 该页是否已写满 */
+    bool flushed; /* 是否已刷到磁盘 */
 } _store_wbuf;
 
+/* 外部存储的“页”：一块固定大小的磁盘空间，内部存放若干被换出的 item */
 typedef struct _store_page {
-    pthread_mutex_t mutex; /* Need to be held for most operations */
-    uint64_t obj_count; /* _delete can decrease post-closing */
-    uint64_t bytes_used; /* _delete can decrease post-closing */
-    uint64_t offset; /* starting address of page within fd */
-    unsigned int version;
+    pthread_mutex_t mutex; /* 多数操作需持有此锁 */
+    uint64_t obj_count; /* 对象数（_delete 关闭后仍可减少） */
+    uint64_t bytes_used; /* 已用字节（同上） */
+    uint64_t offset; /* 该页在 fd 中的起始地址 */
+    unsigned int version; /* 页版本号，用于 IO 校验是否过期 */
     unsigned int refcount;
-    unsigned int allocated;
-    unsigned int written; /* item offsets can be past written if wbuf not flushed */
-    unsigned int bucket; /* which bucket the page is linked into */
-    unsigned int free_bucket; /* which bucket this page returns to when freed */
+    unsigned int allocated; /* 已分配字节 */
+    unsigned int written; /* 已写字节（wbuf 未刷时 item 偏移可能超过它） */
+    unsigned int bucket; /* 该页归属哪个 bucket */
+    unsigned int free_bucket; /* 释放后归还到哪个 bucket */
     int fd;
     unsigned short id;
-    bool active; /* actively being written to */
-    bool closed; /* closed and draining before free */
-    bool free; /* on freelist */
-    _store_wbuf *wbuf; /* currently active wbuf from the stack */
+    bool active; /* 是否正在写入 */
+    bool closed; /* 已关闭、正在排空后释放 */
+    bool free;   /* 是否在空闲链表 */
+    _store_wbuf *wbuf; /* 当前活跃的写缓冲区 */
     struct _store_page *next;
 } store_page;
 
 typedef struct store_engine store_engine;
+/* IO 线程结构：每个线程持有一条 obj_io 任务队列，循环取任务做读写 */
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     obj_io *queue;
     obj_io *queue_tail;
     store_engine *e;
-    unsigned int depth; // queue depth
+    unsigned int depth; // 队列深度
 } store_io_thread;
 
-// sub-struct for maintenance related tasks.
+// 维护相关任务的子结构
 struct store_maint {
     pthread_mutex_t mutex;
 };
 
+/* 外部存储引擎主结构：管理内存中的 page、wbuf、IO 线程及统计 */
 struct store_engine {
-    pthread_mutex_t mutex; /* covers internal stacks and variables */
-    store_page *pages; /* directly addressable page list */
-    _store_wbuf *wbuf_stack; /* wbuf freelist */
-    obj_io *io_stack; /* IO's to use with submitting wbuf's */
-    store_io_thread *io_threads;
-    store_io_thread *bg_thread; /* dedicated thread for write submit / compact ops */
-    store_page **page_buckets; /* stack of pages currently allocated to each bucket */
-    store_page **free_page_buckets; /* stack of use-case isolated free pages */
+    pthread_mutex_t mutex; /* 保护内部栈与变量 */
+    store_page *pages; /* 可直接寻址的页列表 */
+    _store_wbuf *wbuf_stack; /* 写缓冲区空闲栈 */
+    obj_io *io_stack; /* 提交写缓冲时复用的 IO 对象栈 */
+    store_io_thread *io_threads; /* 若干 IO 线程 */
+    store_io_thread *bg_thread; /* 专用线程：处理写提交与压缩 */
+    store_page **page_buckets; /* 各 bucket 当前已分配页的栈 */
+    store_page **free_page_buckets; /* 按使用场景隔离的空闲页栈 */
     size_t page_size;
-    unsigned int version; /* global version counter */
-    unsigned int last_io_thread; /* round robin the IO threads */
-    unsigned int io_threadcount; /* count of IO threads */
+    unsigned int version; /* 全局版本计数器 */
+    unsigned int last_io_thread; /* 轮询分配 IO 线程用 */
+    unsigned int io_threadcount; /* IO 线程数 */
     unsigned int page_count;
-    unsigned int page_free; /* unallocated pages */
-    unsigned int page_bucketcount; /* count of potential page buckets */
-    unsigned int free_page_bucketcount; /* count of free page buckets */
-    unsigned int io_depth; /* FIXME: Might cache into thr struct */
+    unsigned int page_free; /* 未分配页数量 */
+    unsigned int page_bucketcount; /* 潜在 page bucket 数量 */
+    unsigned int free_page_bucketcount; /* 空闲 page bucket 数量 */
+    unsigned int io_depth; /* 队列深度（可缓存到线程结构） */
     pthread_mutex_t stats_mutex;
     struct extstore_stats stats;
     struct store_maint maint;
@@ -579,15 +583,10 @@ static void _submit_wbuf(store_engine *e, store_page *p) {
     extstore_submit_bg(e, io);
 }
 
-/* engine write function; takes engine, item_io.
- * fast fail if no available write buffer (flushing)
- * lock engine context, find active page, unlock
- * if page full, submit page/buffer to io thread.
- *
- * write is designed to be flaky; if page full, caller must try again to get
- * new page. best if used from a background thread that can harmlessly retry.
- */
-
+/* 引擎写请求：为一次写操作分配写缓冲区（wbuf）。若无可用 wbuf（正在刷盘）
+ * 则快速失败；找到活跃页后，若页满则先把当前 wbuf 提交给 IO 线程。
+ * 写被设计为“可能失败”——若页满，调用方需重试以获取新页，最好由后台线程
+ * 无害地重试。 */
 int extstore_write_request(void *ptr, unsigned int bucket,
         unsigned int free_bucket, obj_io *io) {
     store_engine *e = (store_engine *)ptr;
@@ -646,9 +645,8 @@ int extstore_write_request(void *ptr, unsigned int bucket,
     return ret;
 }
 
-/* _must_ be called after a successful write_request.
- * fills the rest of io structure.
- */
+/* 必须在 extstore_write_request 成功后调用：填充 io 的剩余字段
+ * （页内偏移、版本号），并推进 wbuf 指针、累计统计。调用结束时解锁页。 */
 void extstore_write(void *ptr, obj_io *io) {
     store_engine *e = (store_engine *)ptr;
     store_page *p = &e->pages[io->page_id];
@@ -669,11 +667,8 @@ void extstore_write(void *ptr, obj_io *io) {
     pthread_mutex_unlock(&p->mutex);
 }
 
-/* engine submit function; takes engine, item_io stack.
- * lock io_thread context and add stack
- * signal io thread to wake.
- * return success.
- */
+/* 引擎提交函数：把一批 obj_io 任务挂到指定 IO 线程的队列并唤醒它去执行读写。
+ * 返回是否成功。 */
 static int _extstore_submit(void *ptr, obj_io *io, store_io_thread *t) {
     unsigned int depth = 0;
     obj_io *tio = io;
@@ -835,7 +830,9 @@ static inline int _read_from_wbuf(store_page *p, obj_io *io) {
  * manage writes/reads
  * runs IO callbacks inline after each IO
  */
-// FIXME: protect from reading past page
+// FIXME: 防止读到页末尾之外
+/* 外部存储的 IO 工作线程：循环从队列取出一批读写任务执行，并在每次 IO 后
+ * 内联调用回调，通知上层（memcached 工作线程）结果。 */
 static void *extstore_io_thread(void *arg) {
     store_io_thread *me = (store_io_thread *)arg;
     store_engine *e = me->e;

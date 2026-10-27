@@ -1,8 +1,14 @@
+/* 分段 LRU 的四种队列类型：用 slabs_clsid 的高 2 位（即 3<<6）区分。
+ * HOT   : 刚写入/被访问的新 item，先放这里做短期保护
+ * WARM  : 从 COLD 命中回升的 item
+ * COLD  : 最可能被逐出的冷数据（LRU 淘汰从这里取尾）
+ * TEMP  : 短 TTL 的临时数据，独立于主 LRU 之外 */
 #define HOT_LRU 0
 #define WARM_LRU 64
 #define COLD_LRU 128
 #define TEMP_LRU 192
 
+/* 从 id 中清除/取出 LRU 类型位（高 2 位） */
 #define CLEAR_LRU(id) (id & ~(3<<6))
 #define GET_LRU(id) (id & (3<<6))
 
@@ -35,9 +41,10 @@ item *do_item_crawl_q(item *it);
 
 void *item_lru_bump_buf_create(void);
 
-#define LRU_PULL_EVICT 1
-#define LRU_PULL_CRAWL_BLOCKS 2
-#define LRU_PULL_RETURN_ITEM 4 /* fill info struct if available */
+/* lru_pull_tail 的标志位：控制从 LRU 尾部回收 item 时的行为 */
+#define LRU_PULL_EVICT 1        /* 为腾出内存而逐出 */
+#define LRU_PULL_CRAWL_BLOCKS 2 /* 爬虫式批量扫描回收 */
+#define LRU_PULL_RETURN_ITEM 4  /* 若有可用 item，则填充返回信息结构 */
 
 struct lru_pull_tail_return {
     item *it;

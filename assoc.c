@@ -28,30 +28,30 @@
 static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* how many powers of 2's worth of buckets we use */
+/* 哈希表的桶数量 = 2^hashpower（动态扩容用） */
 unsigned int hashpower = HASHPOWER_DEFAULT;
 
 #define hashsize(n) ((uint64_t)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
-/* Main hash table. This is where we look except during expansion. */
+/* 主哈希表：除扩容期间外，所有查找都在这里进行 */
 static item** primary_hashtable = 0;
 
 /*
- * Previous hash table. During expansion, we look here for keys that haven't
- * been moved over to the primary yet.
+ * 旧的哈希表：扩容期间尚未迁移到新表的 key 仍保留在此处。
  */
 static item** old_hashtable = 0;
 
-/* Flag: Are we in the middle of expanding now? */
+/* 是否正处于扩容（rehash）过程中 */
 static bool expanding = false;
 
 /*
- * During expansion we migrate values with bucket granularity; this is how
- * far we've gotten so far. Ranges from 0 .. hashsize(hashpower - 1) - 1.
+ * 扩容时按“桶”粒度逐步迁移：expand_bucket 记录已经迁移到的桶下标，
+ * 范围 0 .. hashsize(hashpower - 1) - 1。
  */
 static uint64_t expand_bucket = 0;
 
+/* 初始化哈希表：分配 primary_hashtable 并登记统计信息 */
 void assoc_init(const int hashtable_init) {
     if (hashtable_init) {
         hashpower = hashtable_init;
@@ -67,6 +67,8 @@ void assoc_init(const int hashtable_init) {
     STATS_UNLOCK();
 }
 
+/* 按 key（及预计算的哈希值 hv）在哈希表中查找 item，沿冲突链比较 key。
+ * 扩容进行中且旧桶尚未迁移时，会去 old_hashtable 查找。 */
 item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
     item *it;
     uint64_t oldbucket;
@@ -118,7 +120,8 @@ static item** _hashitem_before (const char *key, const size_t nkey, const uint32
     return pos;
 }
 
-/* grows the hashtable to the next power of 2. */
+/* 把哈希表容量翻倍（下一个 2 的幂）：把旧表挂为 old_hashtable，分配新表，
+ * 随后由维护线程逐步迁移，扩容期间读写仍可正常工作。 */
 static void assoc_expand(void) {
     old_hashtable = primary_hashtable;
 
@@ -149,11 +152,12 @@ void assoc_start_expand(uint64_t curr_items) {
     }
 }
 
-/* Note: this isn't an assoc_update.  The key must not already exist to call this */
+/* 在哈希表中插入 item（要求 key 此前不存在）。扩容中且旧桶尚未迁移时，
+ * 先插入 old_hashtable，等待迁移线程稍后搬入新表。 */
 int assoc_insert(item *it, const uint32_t hv) {
     uint64_t oldbucket;
 
-//    assert(assoc_find(ITEM_key(it), it->nkey) == 0);  /* shouldn't have duplicately named things defined */
+//    assert(assoc_find(ITEM_key(it), it->nkey) == 0);  /* 不应插入已存在的 key */
 
     if (expanding &&
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
@@ -169,22 +173,20 @@ int assoc_insert(item *it, const uint32_t hv) {
     return 1;
 }
 
+/* 从哈希表中删除指定 key 的 item：找到其前驱指针并跳过它 */
 void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
     item **before = _hashitem_before(key, nkey, hv);
 
     if (*before) {
         item *nxt;
-        /* The DTrace probe cannot be triggered as the last instruction
-         * due to possible tail-optimization by the compiler
-         */
+        /* DTrace 探针不能作为最后一条指令，否则可能被编译器尾优化掉 */
         MEMCACHED_ASSOC_DELETE(key, nkey);
         nxt = (*before)->h_next;
-        (*before)->h_next = 0;   /* probably pointless, but whatever. */
+        (*before)->h_next = 0;   /* 多半无意义，但图个安心 */
         *before = nxt;
         return;
     }
-    /* Note:  we never actually get here.  the callers don't delete things
-       they can't find. */
+    /* 注意：实际不会走到这里，调用方只会删除找得到的东西 */
     assert(*before != 0);
 }
 
@@ -194,22 +196,22 @@ static volatile int do_run_maintenance_thread = 1;
 #define DEFAULT_HASH_BULK_MOVE 1
 int hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
 
+/* 哈希表维护线程：在扩容进行时，按桶粒度把 old_hashtable 中的 item
+ * 重新哈希并搬入新表，搬完即释放旧表。也响应 assoc_start_expand 的扩容信号。 */
 static void *assoc_maintenance_thread(void *arg) {
 
     mutex_lock(&maintenance_lock);
     while (do_run_maintenance_thread) {
         int ii = 0;
 
-        /* There is only one expansion thread, so no need to global lock. */
+        /* 只有一个扩容线程，无需全局锁 */
         for (ii = 0; ii < hash_bulk_move && expanding; ++ii) {
             item *it, *next;
             uint64_t bucket;
             void *item_lock = NULL;
 
-            /* bucket = hv & hashmask(hashpower) =>the bucket of hash table
-             * is the lowest N bits of the hv, and the bucket of item_locks is
-             *  also the lowest M bits of hv, and N is greater than M.
-             *  So we can process expanding with only one item_lock. cool! */
+            /* 桶号 = hv 的低 N 位，而 item 锁的编号 = hv 的低 M 位（N > M）。
+             * 因此迁移一个桶只需取一把 item_lock 即可，无需更多锁，巧妙！ */
             if ((item_lock = item_trylock(expand_bucket))) {
                     for (it = old_hashtable[expand_bucket]; NULL != it; it = next) {
                         next = it->h_next;

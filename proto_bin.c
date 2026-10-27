@@ -46,10 +46,12 @@ void complete_nread_binary(conn *c) {
     }
 }
 
+/* 二进制协议命令解析入口：先收齐 24 字节请求头，做网络字节序到主机序的转换，
+ * 校验 magic 与完整包长度；收齐后再取出 key/ext，最后交给 dispatch_bin_command 分发。 */
 int try_read_command_binary(conn *c) {
-    /* Do we have the complete packet header? */
+    /* 是否已收齐完整的包头部？ */
     if (c->rbytes < sizeof(c->binary_header)) {
-        /* need more data! */
+        /* 需要更多数据！ */
         return 0;
     } else {
         memcpy(&c->binary_header, c->rcurr, sizeof(c->binary_header));
@@ -57,7 +59,7 @@ int try_read_command_binary(conn *c) {
         req = &c->binary_header;
 
         if (settings.verbose > 1) {
-            /* Dump the packet before we convert it to host order */
+            /* 在转换为本机字节序前把包内容打出来 */
             int ii;
             fprintf(stderr, "<%d Read binary protocol data:", c->sfd);
             for (ii = 0; ii < sizeof(req->bytes); ++ii) {
@@ -86,8 +88,7 @@ int try_read_command_binary(conn *c) {
         uint8_t extlen = c->binary_header.request.extlen;
         uint16_t keylen = c->binary_header.request.keylen;
         if (c->rbytes < keylen + extlen + sizeof(c->binary_header)) {
-            // Still need more bytes. Let try_read_network() realign the
-            // read-buffer and fetch more data as necessary.
+            // 仍需要更多字节，交给 try_read_network 重新对齐读缓冲并继续收
             return 0;
         }
 
@@ -453,6 +454,8 @@ static void write_bin_miss_response(conn *c, char *key, size_t nkey) {
     }
 }
 
+/* 处理二进制协议的 get/getk/gat/gatk/touch 命令：按 key 查找 item，
+ * 命中则构造带 value 的响应；touch/gat 系列还会刷新过期时间。 */
 static void process_bin_get_or_touch(conn *c, char *extbuf) {
     item *it;
 
@@ -883,6 +886,8 @@ static bool authenticated(conn *c) {
     return rv;
 }
 
+/* 二进制协议命令分发：先校验 key/body 长度与 SASL 认证，再把带 Q（quiet）后缀的
+ * 命令归一化为普通命令，最后按 opcode 分派到对应的处理函数。 */
 static void dispatch_bin_command(conn *c, char *extbuf) {
     int protocol_error = 0;
 
@@ -1077,6 +1082,8 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         handle_binary_protocol_error(c);
 }
 
+/* 处理二进制协议的 set/add/replace 命令：从请求中取出 key 与 value 长度，
+ * 转换 ext 字段字节序后分配 item，并切到 conn_nread 读取 value 体。 */
 static void process_bin_update(conn *c, char *extbuf) {
     char *key;
     uint16_t nkey;
@@ -1089,7 +1096,7 @@ static void process_bin_update(conn *c, char *extbuf) {
     key = binary_get_key(c);
     nkey = c->binary_header.request.keylen;
 
-    /* fix byteorder in the request */
+    /* 修正请求中的字节序 */
     req->message.body.flags = ntohl(req->message.body.flags);
     req->message.body.expiration = ntohl(req->message.body.expiration);
 

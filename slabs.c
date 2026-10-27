@@ -21,32 +21,34 @@
 //#define DEBUG_SLAB_MOVER
 /* powers-of-N allocation structures */
 
+/* 单个 slab class 的描述结构：管理一种固定 chunk 大小的内存页集合 */
 typedef struct {
-    uint32_t size;      /* sizes of items */
-    uint32_t perslab;   /* how many items per slab */
+    uint32_t size;      /* 该类每个 chunk（item）的大小 */
+    uint32_t perslab;   /* 每个 slab 页能切出多少个 chunk */
 
-    void *slots;           /* list of item ptrs */
-    unsigned int sl_curr;   /* total free items in list */
+    void *slots;           /* 空闲 chunk 链表（item 指针串成） */
+    unsigned int sl_curr;   /* 空闲链表中当前空闲 chunk 数量 */
 
-    unsigned int slabs;     /* how many slabs were allocated for this class */
+    unsigned int slabs;     /* 该类已分配了多少个 slab 页 */
 
-    void **slab_list;       /* array of slab pointers */
-    unsigned int list_size; /* size of prev array */
+    void **slab_list;       /* 已分配 slab 页指针数组 */
+    unsigned int list_size; /* slab_list 数组当前容量 */
 } slabclass_t;
 
+/* 所有 slab class 的全局数组，索引即 class id */
 static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
-static size_t mem_limit = 0;
-static size_t mem_malloced = 0;
-/* If the memory limit has been hit once. Used as a hint to decide when to
- * early-wake the LRU maintenance thread */
+static size_t mem_limit = 0;       /* 全局内存上限 */
+static size_t mem_malloced = 0;    /* 已 malloc 的内存总量 */
+/* 内存上限是否曾到达过，作为是否提前唤醒 LRU 维护线程的提示 */
 static bool mem_limit_reached = false;
-static int power_largest;
+static int power_largest;          /* 当前最大的有效 slab class 编号 */
 
+/* 预分配模式下，整块连续内存的基址与剩余量 */
 static void *mem_base = NULL;
 static void *mem_current = NULL;
 static size_t mem_avail = 0;
 /**
- * Access to the slab allocator is protected by this lock
+ * 整个 slab 分配器的访问由这把全局锁保护
  */
 static pthread_mutex_t slabs_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -74,13 +76,16 @@ static void slabs_preallocate (const unsigned int maxslabs);
  * 0 means error: can't store such a large object
  */
 
+/* 根据对象大小定位合适的 slab class id。
+ * 从最小 class 起递增，找到第一个 chunk 大小 >= size 的 class；
+ * 若超过最大 item 尺寸则返回 0（表示无法存储）。 */
 unsigned int slabs_clsid(const size_t size) {
     int res = POWER_SMALLEST;
 
     if (size == 0 || size > settings.item_size_max)
         return 0;
     while (size > slabclass[res].size)
-        if (res++ == power_largest)     /* won't fit in the biggest slab */
+        if (res++ == power_largest)     /* 连最大的 slab 都装不下 */
             return power_largest;
     return res;
 }
@@ -344,6 +349,7 @@ int slabs_grow_slab_list(const unsigned int id) {
     return ret;
 }
 
+/* 把一个新申请的 slab 页切分成 perslab 个 chunk，逐个加入空闲链表 */
 static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     int x;
@@ -353,7 +359,7 @@ static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
     }
 }
 
-/* Fast FIFO queue */
+/* 从全局页池（SLAB_GLOBAL_PAGE_POOL）取一页：用于 slab 重分配时在 class 间搬运 */
 static void *get_page_from_global_pool(void) {
     slabclass_t *p = &slabclass[SLAB_GLOBAL_PAGE_POOL];
     if (p->slabs < 1) {
@@ -364,6 +370,8 @@ static void *get_page_from_global_pool(void) {
     return ret;
 }
 
+/* 为指定 slab class 新建一个 slab 页：先尝试从全局页池取一页，
+ * 否则向系统申请一块连续内存，清零后切分成 chunk 挂入该类的空闲链表。 */
 static int do_slabs_newslab(const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     slabclass_t *g = &slabclass[SLAB_GLOBAL_PAGE_POOL];
@@ -387,10 +395,7 @@ static int do_slabs_newslab(const unsigned int id) {
         return 0;
     }
 
-    // Always wipe the memory at this stage: in restart mode the mmap memory
-    // could be unused, yet still full of data. Better for usability if we're
-    // wiping memory as it's being pulled out of the global pool instead of
-    // blocking startup all at once.
+    // 此阶段总是清零：重启模式下 mmap 内存可能残留旧数据，边取用边清零更顺滑。
     memset(ptr, 0, (size_t)len);
     split_slab_page_into_freelist(ptr, id);
 
@@ -401,6 +406,8 @@ static int do_slabs_newslab(const unsigned int id) {
 }
 
 /*@null@*/
+/* 从指定 slab class 分配一个对象（chunk）。优先取空闲链表；
+ * 若空闲链表为空且未禁止新建页，则先新建一个 slab 页再分配。 */
 static void *do_slabs_alloc(unsigned int id,
         unsigned int flags) {
     slabclass_t *p;
@@ -414,19 +421,17 @@ static void *do_slabs_alloc(unsigned int id,
     p = &slabclass[id];
     assert(p->sl_curr == 0 || (((item *)p->slots)->it_flags & ITEM_SLABBED));
 
-    /* fail unless we have space at the end of a recently allocated page,
-       we have something on our freelist, or we could allocate a new page */
+    /* 若空闲链表为空且允许新建页，则先尝试扩一个新 slab 页 */
     if (p->sl_curr == 0 && flags != SLABS_ALLOC_NO_NEWPAGE) {
         do_slabs_newslab(id);
     }
 
     if (p->sl_curr != 0) {
-        /* return off our freelist */
+        /* 从空闲链表头部摘下一个 chunk */
         it = (item *)p->slots;
         p->slots = it->next;
         if (it->next) it->next->prev = 0;
-        /* Kill flag and initialize refcount here for lock safety in slab
-         * mover's freeness detection. */
+        /* 清除 SLABBED 标志并初始化引用计数为 1（保证 slab 搬运线程能安全判断空闲） */
         it->it_flags &= ~ITEM_SLABBED;
         it->refcount = 1;
         p->sl_curr--;
@@ -491,6 +496,8 @@ static void do_slabs_free_chunked(item *it) {
     return;
 }
 
+/* 释放一个对象：把它重新挂回所在 slab class 的空闲链表（SLABBED 状态），
+ * 以便下次分配复用。若是被切分的 chunked item，则逐段归还。 */
 static void do_slabs_free(void *ptr, unsigned int id) {
     slabclass_t *p;
     item *it;

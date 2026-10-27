@@ -4,6 +4,8 @@
  * The main memcached header holding commonly used data
  * structures and function prototypes.
  */
+#ifndef MEMCACHED_H
+#define MEMCACHED_H
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -124,31 +126,39 @@ typedef uint32_t client_flags_t;
 #define TAIL_REPAIR_TIME_DEFAULT 0
 
 /* warning: don't use these macros with a function, as it evals its arg twice */
+/* 读取 item 的 CAS（compare-and-swap）值；若未开启 CAS 则返回 0 */
 #define ITEM_get_cas(i) (((i)->it_flags & ITEM_CAS) ? \
         (i)->data->cas : (uint64_t)0)
 
+/* 设置 item 的 CAS 值（仅当该 item 启用了 ITEM_CAS 标志时生效） */
 #define ITEM_set_cas(i,v) { \
     if ((i)->it_flags & ITEM_CAS) { \
         (i)->data->cas = v; \
     } \
 }
 
+/* 取得 key 的起始地址：CAS 占用 8 字节时，key 紧跟在 CAS 之后 */
 #define ITEM_key(item) (((char*)&((item)->data)) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
+/* 取得 suffix（客户端 flag）的起始地址：位于 key 及结尾 '\0' 之后 */
 #define ITEM_suffix(item) ((char*) &((item)->data) + (item)->nkey + 1 \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
+/* 取得真正数据（value）的起始地址：依次跳过 key、客户端 flag、CAS */
 #define ITEM_data(item) ((char*) &((item)->data) + (item)->nkey + 1 \
          + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(client_flags_t) : 0) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
+/* 计算 item 在内存中的总占用字节数（结构体本身 + key + value + 各种可选字段） */
 #define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
          + (item)->nbytes \
          + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(client_flags_t) : 0) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
+/* 从 slabs_clsid 中分解出真正的 slab class id（低 6 位） */
 #define ITEM_clsid(item) ((item)->slabs_clsid & ~(3<<6))
+/* 从 slabs_clsid 中分解出 LRU id（高 2 位，表示 HOT/WARM/COLD 等 LRU 类型） */
 #define ITEM_lruid(item) ((item)->slabs_clsid & (3<<6))
 
 #define STAT_KEY_LEN 128
@@ -199,23 +209,24 @@ typedef void (*ADD_STAT)(const char *key, const uint16_t klen,
 /**
  * Possible states of a connection.
  */
+/* 连接的状态机：memcached 采用基于 libevent 的状态机处理每个客户端连接 */
 enum conn_states {
-    conn_listening,  /**< the socket which listens for connections */
-    conn_new_cmd,    /**< Prepare connection for next command */
-    conn_waiting,    /**< waiting for a readable socket */
-    conn_read,       /**< reading in a command line */
-    conn_parse_cmd,  /**< try to parse a command from the input buffer */
-    conn_write,      /**< writing out a simple response */
-    conn_nread,      /**< reading in a fixed number of bytes */
-    conn_swallow,    /**< swallowing unnecessary bytes w/o storing */
-    conn_closing,    /**< closing this connection */
-    conn_mwrite,     /**< writing out many items sequentially */
-    conn_closed,     /**< connection is closed */
-    conn_watch,      /**< held by the logger thread as a watcher */
-    conn_io_queue,   /**< wait on async. process to get response object */
-    conn_io_resume,  /**< ready to resume mwrite after async work */
-    conn_io_pending, /**< got woken up while waiting for async work */
-    conn_max_state   /**< Max state value (used for assertion) */
+    conn_listening,  /**< 监听套接字，等待新连接接入 */
+    conn_new_cmd,    /**< 准备处理下一条命令（重置读取状态） */
+    conn_waiting,    /**< 等待套接字可读事件 */
+    conn_read,       /**< 正在读取命令行的输入 */
+    conn_parse_cmd,  /**< 尝试从输入缓冲区解析一条命令 */
+    conn_write,      /**< 写出一条简单响应 */
+    conn_nread,      /**< 读取固定长度的字节（如 value 体） */
+    conn_swallow,    /**< 丢弃不需要的字节（不存储） */
+    conn_closing,    /**< 正在关闭该连接 */
+    conn_mwrite,     /**< 顺序写出多个 item 响应 */
+    conn_closed,     /**< 连接已关闭 */
+    conn_watch,      /**< 被日志线程持有时作为 watcher */
+    conn_io_queue,   /**< 等待异步处理返回响应对象 */
+    conn_io_resume,  /**< 异步工作完成后准备恢复 mwrite */
+    conn_io_pending, /**< 等待异步工作时被唤醒 */
+    conn_max_state   /**< 最大状态值（用于断言） */
 };
 
 enum bin_substates {
@@ -446,9 +457,10 @@ struct stats_state {
 
 #define MAX_VERBOSITY_LEVEL 2
 
-/* When adding a setting, be sure to update process_stat_settings */
+/* 新增配置项时，记得同步更新 process_stat_settings 的统计输出 */
 /**
- * Globally accessible settings as derived from the commandline.
+ * 全局配置：由命令行参数解析而来，memcached 运行期间可随时读取。
+ * 涵盖了监听端口、线程数、内存上限、slab 策略、LRU 策略等核心参数。
  */
 struct settings {
     size_t maxbytes;
@@ -562,50 +574,55 @@ extern struct stats_state stats_state;
 extern time_t process_started;
 extern struct settings settings;
 
+/* 表示 item 已挂入哈希表与 LRU 队列（处于“已链接”状态） */
 #define ITEM_LINKED 1
+/* 表示 item 带有 CAS 字段（占用 8 字节） */
 #define ITEM_CAS 2
 
-/* temp */
+/* 临时状态：item 正被分配在 slab 中尚未链接 */
 #define ITEM_SLABBED 4
 
-/* Item was fetched at least once in its lifetime */
+/* item 在其生命周期内至少被访问（fetch）过一次 */
 #define ITEM_FETCHED 8
-/* Appended on fetch, removed on LRU shuffling */
+/* 访问时在 LRU 中标记为活跃；LRU 重排时会被清除 */
 #define ITEM_ACTIVE 16
-/* If an item's storage are chained chunks. */
+/* item 的数据由链式 chunk 组成（大对象被切分存储） */
 #define ITEM_CHUNKED 32
+/* 当前结构本身是一个 chunk（而非完整 item 头） */
 #define ITEM_CHUNK 64
-/* ITEM_data bulk is external to item */
+/* item 的 data 主体存储于 item 之外的外部存储中 */
 #define ITEM_HDR 128
-/* additional 4 bytes for item client flags */
+/* item 带有额外的 4（或 8）字节客户端 flag */
 #define ITEM_CFLAGS 256
-/* item has sent out a token already */
+/* item 已经发出过一个 token */
 #define ITEM_TOKEN_SENT 512
-/* reserved, in case tokens should be a 2-bit count in future */
+/* 保留位，供将来 token 作为 2-bit 计数使用 */
 #define ITEM_TOKEN_RESERVED 1024
-/* if item has been marked as a stale value */
+/* item 被标记为过期/陈旧值 */
 #define ITEM_STALE 2048
-/* if item key was sent in binary */
+/* item 的 key 以二进制形式发送 */
 #define ITEM_KEY_BINARY 4096
 
 /**
  * Structure for storing items within memcached.
  */
+/* memcached 中存储对象（缓存条目）的核心结构。
+ * 注意其内存布局紧凑：结构体尾部之后紧跟着 key、可选的客户端 flag、
+ * 可选的 CAS、以及 value 数据，以节省内存开销。 */
 typedef struct _stritem {
-    /* Protected by LRU locks */
+    /* 受 LRU 锁保护：用于 LRU 双向链表的指针 */
     struct _stritem *next;
     struct _stritem *prev;
-    /* Rest are protected by an item lock */
-    struct _stritem *h_next;    /* hash chain next */
-    rel_time_t      time;       /* least recent access */
-    rel_time_t      exptime;    /* expire time */
-    int             nbytes;     /* size of data */
-    unsigned short  refcount;
-    uint16_t        it_flags;   /* ITEM_* above */
-    uint8_t         slabs_clsid;/* which slab class we're in */
-    uint8_t         nkey;       /* key length, w/terminating null and padding */
-    /* this odd type prevents type-punning issues when we do
-     * the little shuffle to save space when not using CAS. */
+    /* 其余字段受 item 锁保护 */
+    struct _stritem *h_next;    /* 哈希冲突链中的下一个 item */
+    rel_time_t      time;       /* 最近一次访问时间（用于 LRU） */
+    rel_time_t      exptime;    /* 过期时间（0 表示永不过期） */
+    int             nbytes;     /* value 数据的字节数 */
+    unsigned short  refcount;   /* 引用计数，防止被并发释放 */
+    uint16_t        it_flags;   /* 见上方 ITEM_* 标志位 */
+    uint8_t         slabs_clsid;/* 所在 slab class id（含高 2 位 LRU id） */
+    uint8_t         nkey;       /* key 长度（含结尾 '\0' 及对齐填充） */
+    /* 这个特殊的联合体避免了在不使用 CAS 时做“空间压缩”带来的类型双关问题 */
     union {
         uint64_t cas;
         char end;
@@ -715,39 +732,41 @@ struct thread_notify {
 };
 
 typedef struct _mc_resp_bundle mc_resp_bundle;
+/* 工作线程（worker thread）的核心对象：每个线程拥有独立的 libevent 事件循环，
+ * 通过通知管道/eventfd 与主线程或其它线程通信，并在多线程间安全传递连接。 */
 typedef struct {
-    pthread_t thread_id;        /* unique ID of this thread */
-    struct event_base *base;    /* libevent handle this thread uses */
-    struct thread_notify n;     /* for thread notification */
-    struct thread_notify ion;   /* for thread IO object notification */
-    pthread_mutex_t ion_lock;   /* mutex for ion_head */
-    iop_head_t ion_head;        /* queue for IO object return */
-    int cur_sfd;                /* client fd for logging commands */
-    int thread_baseid;          /* which "number" thread this is for data offsets */
-    int conns_tosubmit;         /* number of conns which have put data in io_queue */
-    struct thread_stats stats;  /* Stats generated by this thread */
-    io_queue_t io_queues[IO_QUEUE_COUNT];
-    struct conn_queue *ev_queue; /* Worker/conn event queue */
-    cache_t *rbuf_cache;        /* static-sized read buffers */
-    mc_resp_bundle *open_bundle;
-    cache_t *io_cache;          /* IO objects */
+    pthread_t thread_id;        /* 线程唯一 ID */
+    struct event_base *base;    /* 该线程使用的 libevent 事件循环 */
+    struct thread_notify n;     /* 线程间通知机制（接收新连接等） */
+    struct thread_notify ion;   /* IO 对象回收通知机制 */
+    pthread_mutex_t ion_lock;   /* 保护 ion_head 的互斥锁 */
+    iop_head_t ion_head;        /* IO 对象回收队列 */
+    int cur_sfd;                /* 记录当前客户端 fd，用于日志命令 */
+    int thread_baseid;          /* 该线程的编号，用于数据偏移 */
+    int conns_tosubmit;         /* 已放入 io_queue 的连接数 */
+    struct thread_stats stats;  /* 该线程产生的统计数据 */
+    io_queue_t io_queues[IO_QUEUE_COUNT]; /* IO 队列（外部存储/代理等） */
+    struct conn_queue *ev_queue; /* 连接事件队列 */
+    cache_t *rbuf_cache;        /* 固定大小的读缓冲区缓存池 */
+    mc_resp_bundle *open_bundle;/* 当前打开的响应 bundle */
+    cache_t *io_cache;          /* IO 对象缓存池 */
 #ifdef EXTSTORE
-    void *storage;              /* data object for storage system */
+    void *storage;              /* 外部存储系统数据对象 */
 #endif
-    logger *l;                  /* logger buffer */
-    void *lru_bump_buf;         /* async LRU bump buffer */
+    logger *l;                  /* 该线程的日志缓冲区 */
+    void *lru_bump_buf;         /* 异步 LRU 更新缓冲 */
 #ifdef TLS
-    char   *ssl_wbuf;
+    char   *ssl_wbuf;           /* SSL 写缓冲 */
 #endif
-    int napi_id;                /* napi id associated with this thread */
+    int napi_id;                /* 该线程关联的 NAPI id（网络加速） */
 #ifdef PROXY
-    void *proxy_ctx; // proxy global context
-    void *L; // lua VM
+    void *proxy_ctx; // 代理全局上下文
+    void *L; // Lua 虚拟机
     void *proxy_hooks;
     void *proxy_user_stats;
     void *proxy_int_stats;
-    void *proxy_event_thread; // worker threads can also be proxy IO threads
-    struct event *proxy_gc_timer; // periodic GC pushing.
+    void *proxy_event_thread; // worker 线程也可作为代理 IO 线程
+    struct event *proxy_gc_timer; // 周期性 GC 定时器
     pthread_mutex_t proxy_limit_lock;
     int proxy_vm_extra_kb;
     int proxy_vm_last_kb;
@@ -755,7 +774,7 @@ typedef struct {
     int proxy_vm_gcrunning;
     int proxy_vm_gcpokemem;
     int64_t proxy_active_req_limit;
-    uint64_t proxy_buffer_memory_limit; // protected by limit_lock
+    uint64_t proxy_buffer_memory_limit; // 受 limit_lock 保护
     uint64_t proxy_buffer_memory_used; // protected by limit_lock
     uint32_t proxy_rng[4]; // fast per-thread rng for lua.
     // TODO: add ctx object so we can attach to queue.
@@ -766,47 +785,49 @@ typedef struct {
  * Response objects
  */
 #define MC_RESP_IOVCOUNT 4
+/* 单个响应对象：连接通过“响应链”向客户端回送数据。
+ * 支持一次性聚合多个 iovec，减少系统调用次数，提高网络吞吐。 */
 typedef struct _mc_resp {
-    mc_resp_bundle *bundle; // ptr back to bundle
-    struct _mc_resp *next; // choo choo.
-    int wbytes; // bytes to write out of wbuf: might be able to nuke this.
-    int tosend; // total bytes to send for this response
-    void *write_and_free; /** free this memory after finishing writing */
-    io_pending_t *io_pending; /* pending IO descriptor for this response */
+    mc_resp_bundle *bundle; /* 指回所属的响应 bundle */
+    struct _mc_resp *next; /* 响应链表中的下一个 */
+    int wbytes; /* 已经从 wbuf 写出（剩余）的字节数 */
+    int tosend; /* 该响应总共需要发送的字节数 */
+    void *write_and_free; /** 写出完成后需要 free 的内存 */
+    io_pending_t *io_pending; /* 该响应关联的异步 IO 描述符 */
 
-    item *item; /* item associated with this response object, with reference held */
-    struct iovec iov[MC_RESP_IOVCOUNT]; /* built-in iovecs to simplify network code */
-    int chunked_total; /* total amount of chunked item data to send. */
-    uint8_t iovcnt;
-    uint8_t chunked_data_iov; /* this iov is a pointer to chunked data header */
+    item *item; /* 关联的 item（持有引用，防止被释放） */
+    struct iovec iov[MC_RESP_IOVCOUNT]; /* 内置 iovec 数组，简化网络发送 */
+    int chunked_total; /* 需要发送的链式 chunk 数据总量 */
+    uint8_t iovcnt; /* 实际使用的 iovec 数量 */
+    uint8_t chunked_data_iov; /* 指向 chunk 数据头的 iov 下标 */
 
-    /* instruct transmit to skip this response object. used by storage engines
-     * to asynchronously kill an object that was queued to write
-     */
+    /* 通知发送逻辑跳过该响应对象：存储引擎可异步取消已排队写入的响应 */
     bool skip;
-    bool suspended; // waiting for response from subsystem
-    bool free; // double free detection.
+    bool suspended; /* 等待子系统（如外部存储）返回结果 */
+    bool free; /* 双重释放检测标志 */
 #ifdef PROXY
-    bool proxy_res; // we're handling a proxied response buffer.
+    bool proxy_res; /* 正在处理代理返回的缓冲区 */
 #endif
-    // UDP bits. Copied in from the client.
-    uint16_t    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
-    uint16_t    udp_sequence; /* packet counter when transmitting result */
-    uint16_t    udp_total; /* total number of packets in sequence */
-    struct sockaddr_in6 request_addr; /* udp: Who sent this request */
+    // UDP 相关字段，从客户端请求中拷贝而来
+    uint16_t    request_id; /* 入站 UDP 请求 ID */
+    uint16_t    udp_sequence; /* 发送结果时的包序号 */
+    uint16_t    udp_total; /* 序列中的总包数 */
+    struct sockaddr_in6 request_addr; /* UDP：请求来源地址 */
     socklen_t request_addr_size;
 
-    char wbuf[WRITE_BUFFER_SIZE];
+    char wbuf[WRITE_BUFFER_SIZE]; /* 内置写缓冲区 */
 } mc_resp;
 
+/* 一个 bundle 中最多能放多少个响应对象（按内存大小计算） */
 #define MAX_RESP_PER_BUNDLE ((READ_BUFFER_SIZE - sizeof(mc_resp_bundle)) / sizeof(mc_resp))
+/* 响应对象并非单独 malloc，而是成组（bundle）批量分配，减少内存碎片 */
 struct _mc_resp_bundle {
     uint8_t refcount;
-    uint8_t next_check; // next object to check on assignment.
+    uint8_t next_check; /* 分配时下一个待检查的对象下标 */
     LIBEVENT_THREAD *thread;
     struct _mc_resp_bundle *next;
     struct _mc_resp_bundle *prev;
-    mc_resp r[];
+    mc_resp r[]; /* 柔性数组，存放一组响应对象 */
 };
 
 typedef struct conn conn;
@@ -825,89 +846,87 @@ struct _io_pending_t {
 };
 
 /**
- * The structure representing a connection into memcached.
+ * memcached 客户端连接的核心结构，每个连接对应一个状态机。
+ * 通过 libevent 监听可读/可写事件，按 conn_states 状态逐步处理命令。
  */
 struct conn {
-    sasl_conn_t *sasl_conn;
-    int    sfd;
-    bool sasl_started;
-    bool authenticated;
-    bool set_stale;
-    bool mset_res; /** uses mset format for return code */
-    bool close_after_write; /** flush write then move to close connection */
-    bool rbuf_malloced; /** read buffer was malloc'ed for ascii mget, needs free() */
-    bool item_malloced; /** item for conn_nread state is a temporary malloc */
-    uint8_t ssl_enabled;
-    void    *ssl;
+    sasl_conn_t *sasl_conn; /* SASL 认证上下文 */
+    int    sfd;             /* 客户端套接字文件描述符 */
+    bool sasl_started;      /* 是否已开始 SASL 握手 */
+    bool authenticated;     /* 是否已完成认证 */
+    bool set_stale;         /* 是否将写入标记为陈旧 */
+    bool mset_res;          /* 使用 mset 格式返回结果码 */
+    bool close_after_write; /* 写完响应后关闭连接 */
+    bool rbuf_malloced;     /* 读缓冲区是否为 ascii mget 临时 malloc 的 */
+    bool item_malloced;     /* conn_nread 阶段的 item 是否为临时 malloc */
+    uint8_t ssl_enabled;    /* 是否启用 SSL/TLS */
+    void    *ssl;           /* SSL/TLS 会话对象 */
 #ifdef TLS
-    char   *ssl_wbuf;
+    char   *ssl_wbuf;       /* SSL 写缓冲区 */
 #endif
-    enum conn_states  state;
-    enum bin_substates substate;
-    rel_time_t last_cmd_time;
-    struct event event;
-    short  ev_flags;
-    short  which;   /** which events were just triggered */
+    enum conn_states  state;    /* 当前连接状态 */
+    enum bin_substates substate;/* 二进制协议子状态 */
+    rel_time_t last_cmd_time;   /* 最后一条命令的时间，用于超时判断 */
+    struct event event;         /* libevent 事件对象 */
+    short  ev_flags;            /* 关注的事件标志（读/写） */
+    short  which;   /** 刚刚触发的事件类型 */
 
-    char   *rbuf;   /** buffer to read commands into */
-    char   *rcurr;  /** but if we parsed some already, this is where we stopped */
-    int    rsize;   /** total allocated size of rbuf */
-    int    rbytes;  /** how much data, starting from rcur, do we have unparsed */
+    char   *rbuf;   /** 读取命令用的输入缓冲区 */
+    char   *rcurr;  /** 已解析部分之后的当前读取位置 */
+    int    rsize;   /** rbuf 的总分配大小 */
+    int    rbytes;  /** 从 rcurr 起尚未解析的字节数 */
 
-    mc_resp *resp; // tail response.
-    mc_resp *resp_head; // first response in current stack.
-    char   *ritem;  /** when we read in an item's value, it goes here */
-    int    rlbytes;
+    mc_resp *resp;       /* 响应链表尾 */
+    mc_resp *resp_head;  /* 当前响应用例的头 */
+    char   *ritem;  /** 读取 item 的 value 时，数据写入此临时缓冲区 */
+    int    rlbytes;      /* 还需读取的 value 字节数 */
 
     /**
-     * item is used to hold an item structure created after reading the command
-     * line of set/add/replace commands, but before we finished reading the actual
-     * data. The data is read into ITEM_data(item) to avoid extra copying.
+     * set/add/replace 命令读取完命令行但尚未读完 value 数据时，
+     * 会先创建 item 结构放在此处；value 直接读入 ITEM_data(item)，避免二次拷贝。
      */
+    void   *item;     /* set/add/replace 等命令使用的临时 item */
 
-    void   *item;     /* for commands set/add/replace  */
+    /* swallow 状态所需的数据 */
+    int    sbytes;    /* 需要丢弃（swallow）的字节数 */
 
-    /* data for the swallow state */
-    int    sbytes;    /* how many bytes to swallow */
-
-    int resps_suspended; /* see notes on io_queue_cb_t */
+    int resps_suspended; /* 被挂起的响应数量（异步 IO 等待时） */
 #ifdef PROXY
-    void *proxy_rctx; /* pointer to active request context */
+    void *proxy_rctx; /* 当前代理请求上下文 */
 #endif
 #ifdef EXTSTORE
-    unsigned int recache_counter;
+    unsigned int recache_counter; /* 重新缓存计数 */
 #endif
-    enum protocol protocol;   /* which protocol this connection speaks */
-    enum network_transport transport; /* what transport is used by this connection */
-    enum close_reasons close_reason; /* reason for transition into conn_closing */
+    enum protocol protocol;   /* 该连接使用的协议（ascii/binary） */
+    enum network_transport transport; /* 传输方式（tcp/udp/unix socket） */
+    enum close_reasons close_reason; /* 进入 conn_closing 的原因 */
 
-    /* data for UDP clients */
-    int    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
-    struct sockaddr_in6 request_addr; /* udp: Who sent the most recent request */
+    /* UDP 客户端相关数据 */
+    int    request_id; /* 入站 UDP 请求 ID */
+    struct sockaddr_in6 request_addr; /* 最近一次请求的来源地址 */
     socklen_t request_addr_size;
 
-    bool   noreply;   /* True if the reply should not be sent. */
-    /* current stats command */
+    bool   noreply;   /* 为 true 时不发送回复（命令带 noreply 选项） */
+    /* 当前 stats 命令的累积缓冲 */
     struct {
         char *buffer;
         size_t size;
         size_t offset;
     } stats;
 
-    /* Binary protocol stuff */
-    /* This is where the binary header goes */
-    protocol_binary_request_header binary_header;
-    uint64_t cas; /* the cas to return */
-    uint64_t tag; /* listener stocket tag */
-    short cmd; /* current command being processed */
-    int opaque;
-    int keylen;
-    conn   *next;     /* Used for generating a list of conn structures */
-    LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
-    int (*try_read_command)(conn *c); /* pointer for top level input parser */
-    ssize_t (*read)(conn  *c, void *buf, size_t count);
-    ssize_t (*sendmsg)(conn *c, struct msghdr *msg, int flags);
-    ssize_t (*write)(conn *c, void *buf, size_t count);
+    /* 二进制协议相关字段 */
+    protocol_binary_request_header binary_header; /* 存放二进制协议头 */
+    uint64_t cas; /* 需要返回的 cas 值 */
+    uint64_t tag; /* 监听器套接字标签 */
+    short cmd;    /* 当前正在处理的命令 */
+    int opaque;   /* 二进制协议 opaque 透传字段 */
+    int keylen;   /* 当前 key 长度 */
+    conn   *next;     /* 用于把所有 conn 串成链表 */
+    LIBEVENT_THREAD *thread; /* 服务该连接的线程对象 */
+    int (*try_read_command)(conn *c); /* 顶层输入解析函数指针 */
+    ssize_t (*read)(conn  *c, void *buf, size_t count);  /* 读函数指针 */
+    ssize_t (*sendmsg)(conn *c, struct msghdr *msg, int flags); /* 发送函数 */
+    ssize_t (*write)(conn *c, void *buf, size_t count);  /* 写函数指针 */
 };
 
 /* array of conn structures, indexed by file descriptor */
@@ -1090,3 +1109,5 @@ extern void drop_worker_privileges(void);
 
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
+
+#endif /* MEMCACHED_H */

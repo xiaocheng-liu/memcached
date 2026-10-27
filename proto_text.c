@@ -442,6 +442,9 @@ int try_read_command_asciiauth(conn *c) {
     return 1;
 }
 
+/* 文本协议命令解析入口：从读缓冲中按行（以 \n 结尾）取出一条命令，
+ * 去掉结尾 \r\n 后交给 process_command_ascii 处理；若数据不完整则返回 0 等待更多。
+ * 对超长且非 multiget 的行直接关闭连接。 */
 int try_read_command_ascii(conn *c) {
     char *el, *cont;
 
@@ -543,7 +546,8 @@ static inline int make_ascii_get_suffix(char *suffix, item *it, bool return_cas,
     return (p - suffix) + 2;
 }
 
-/* ntokens is overwritten here... shrug.. */
+/* 处理 get/gets/gat/gats 等读命令：遍历命令中的多个 key，逐个查找 item 并
+ * 生成响应（return_cas 决定是否回传 CAS；should_touch 表示同时刷新过期时间）。 */
 static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas, bool should_touch) {
     char *key;
     size_t nkey;
@@ -1995,6 +1999,8 @@ error:
 }
 
 
+/* 处理 set/add/replace/cas 等“更新类”命令：解析 key/flags/exptime/value 长度，
+ * 校验参数后分配 item 并切到 conn_nread 读取 value 体（cas 命令还会校验 cas 值）。 */
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
     char *key;
     size_t nkey;
@@ -2876,6 +2882,9 @@ static void process_refresh_certs_command(conn *c, token_t *tokens, const size_t
 // we can't drop out and back in again.
 // Leaving this note here to spend more time on a fix when necessary, or if an
 // opportunity becomes obvious.
+/* 文本协议命令分发中枢：把一行命令按空格切分为 token，再根据命令首字母/关键字
+ * 分发到具体的处理函数（get/set/meta/stats 等）。set/add/replace 等写命令会先
+ * 建好 item，再切到 conn_nread 去读 value 体。 */
 void process_command_ascii(conn *c, char *command) {
 
     token_t tokens[MAX_TOKENS];
@@ -2890,20 +2899,19 @@ void process_command_ascii(conn *c, char *command) {
         fprintf(stderr, "<%d %s\n", c->sfd, command);
 
     /*
-     * for commands set/add/replace, we build an item and read the data
-     * directly into it, then continue in nread_complete().
+     * 对于 set/add/replace 命令，我们会先构造一个 item，并直接把数据读进它，
+     * 然后在 nread_complete() 中继续处理。
      */
 
-    // Prep the response object for this query.
+    // 为本次查询准备响应对象
     if (!resp_start(c)) {
         conn_set_state(c, conn_closing);
         return;
     }
 
-    c->thread->cur_sfd = c->sfd; // cuddle sfd for logging.
+    c->thread->cur_sfd = c->sfd; // 记下 sfd 方便日志
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
-    // All commands need a minimum of two tokens: cmd and NULL finalizer
-    // There are also no valid commands shorter than two bytes.
+    // 所有命令至少需要两个 token：命令名 + NULL 终结符；也没有短于 2 字节的有效命令
     if (ntokens < 2 || tokens[COMMAND_TOKEN].length < 2) {
         out_string(c, "ERROR");
         return;

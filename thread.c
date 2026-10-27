@@ -75,24 +75,26 @@ pthread_mutex_t atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Lock for global stats */
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Lock to cause worker threads to hang up after being woken */
+/* 用于让 worker 线程在被唤醒后“挂起”的锁 */
 static pthread_mutex_t worker_hang_lock;
 
+/* item 锁：以哈希桶号为索引的一把细粒度锁，避免全局锁竞争。
+ * 修改某 item 或其所在哈希桶前必须持有对应 item_lock。 */
 static pthread_mutex_t *item_locks;
-/* size of the item lock hash table */
+/* item 锁哈希表的大小（= 2^item_lock_hashpower） */
 static uint32_t item_lock_count;
 static unsigned int item_lock_hashpower;
 #define hashsize(n) ((unsigned long int)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
 /*
- * Each libevent instance has a wakeup pipe, which other threads
- * can use to signal that they've put a new connection on its queue.
+ * 每个 libevent 实例都有一条唤醒管道（pipe/eventfd），其他线程可借此通知
+ * “我已把一个新连接放到了它的队列上”，从而唤醒对应 worker 线程的事件循环。
  */
 static LIBEVENT_THREAD *threads;
 
 /*
- * Number of worker threads that have finished setting themselves up.
+ * 已完成自身初始化的 worker 线程数量（用于主线程等待所有线程就绪）。
  */
 static int init_count = 0;
 static pthread_mutex_t init_lock;
@@ -415,7 +417,7 @@ static void setup_thread_notify(LIBEVENT_THREAD *me, struct thread_notify *tn,
 }
 
 /*
- * Set up a thread's information.
+ * 初始化一个 worker 线程的全部资源。
  */
 static void setup_thread(LIBEVENT_THREAD *me) {
 #if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
@@ -502,7 +504,9 @@ static void setup_thread(LIBEVENT_THREAD *me) {
 }
 
 /*
- * Worker thread: main event loop
+ * Worker 线程的主事件循环：创建本线程的日志缓冲与 LRU bump 缓冲后，
+ * 反复执行 event_base_loop（EVLOOP_ONCE 每次处理一批就绪事件），
+ * 循环结束后再提交一次 IO 队列。这是每个 worker 线程“活着”的地方。
  */
 static void *worker_libevent(void *arg) {
     LIBEVENT_THREAD *me = arg;
@@ -582,8 +586,9 @@ static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg)
 }
 
 /*
- * Processes an incoming "connection event" item. This is called when
- * input arrives on the libevent wakeup pipe.
+ * 处理到达 libevent 唤醒管道上的“连接事件”项：读取事件计数后，从本线程的
+ * 连接队列取出对应数量的 CQ_ITEM，按 mode 执行（新建连接 / 暂停 / 超时关闭 /
+ * 重新调度 / 停止等）。这是主线程把工作“投递”给 worker 的关键路径。
  */
 static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) {
     LIBEVENT_THREAD *me = arg;
@@ -765,10 +770,9 @@ select:
 }
 
 /*
- * Dispatches a new connection to another thread. This is only ever called
- * from the main thread, either during initialization (for UDP) or because
- * of an incoming connection.
- */
+ * 把新连接分发给某个 worker 线程。仅由主线程调用（初始化阶段为 UDP，
+ * 或收到新 TCP 连接时）。按轮询或 NAPI id 选好线程后，构造 CQ_ITEM 入队，
+ * 并通知目标线程的唤醒管道。 */
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
                        int read_buffer_size, enum network_transport transport, void *ssl,
                        uint64_t conntag, enum protocol bproto) {
@@ -1076,9 +1080,9 @@ static void memcached_thread_notify_init(struct thread_notify *tn) {
 }
 
 /*
- * Initializes the thread subsystem, creating various worker threads.
+ * 初始化线程子系统：创建 LRU 锁、item 锁表以及若干 worker 线程。
  *
- * nthreads  Number of worker event handler threads to spawn
+ * nthreads  要创建的 worker 事件处理线程数量
  */
 void memcached_thread_init(int nthreads, void *arg) {
     int         i;
@@ -1092,7 +1096,7 @@ void memcached_thread_init(int nthreads, void *arg) {
     pthread_mutex_init(&init_lock, NULL);
     pthread_cond_init(&init_cond, NULL);
 
-    /* Want a wide lock table, but don't waste memory */
+    /* 希望锁表足够宽以减少竞争，又不愿浪费太多内存：按线程数选 power */
     if (nthreads < 3) {
         power = 10;
     } else if (nthreads < 4) {
@@ -1104,7 +1108,7 @@ void memcached_thread_init(int nthreads, void *arg) {
     } else if (nthreads <= 20) {
         power = 14;
     } else {
-        /* 32k buckets. just under the hashpower default. */
+        /* 32k 桶，刚好略小于默认 hashpower */
         power = 15;
     }
 
@@ -1141,16 +1145,16 @@ void memcached_thread_init(int nthreads, void *arg) {
 #endif
         threads[i].thread_baseid = i;
         setup_thread(&threads[i]);
-        /* Reserve three fds for the libevent base, and two for the pipe */
+        /* 为每个线程预留 3 个 libevent fd 与 2 个管道 fd */
         stats_state.reserved_fds += 5;
     }
 
-    /* Create threads after we've done all the libevent setup. */
+    /* 完成所有 libevent 初始化后再创建线程 */
     for (i = 0; i < nthreads; i++) {
         create_worker(worker_libevent, &threads[i]);
     }
 
-    /* Wait for all the threads to set themselves up before returning. */
+    /* 等待所有线程完成自身初始化后再返回 */
     pthread_mutex_lock(&init_lock);
     wait_for_thread_registration(nthreads);
     pthread_mutex_unlock(&init_lock);
